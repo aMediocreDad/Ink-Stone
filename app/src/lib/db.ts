@@ -32,13 +32,16 @@ async function createSpace(name: string, password: string): Promise<Space> {
   const password_hash = hashPassword(password);
 
   if (sb) {
-    const { data, error } = await sb
-      .from('spaces')
-      .insert({ name, invite_code, password_hash })
-      .select()
-      .single();
+    const { data, error } = await sb.rpc('create_space_with_token', {
+      p_name: name,
+      p_invite_code: invite_code,
+      p_password_hash: password_hash,
+    });
     if (error) throw error;
-    return data as Space;
+    const payload = data as { space: Omit<Space, 'password_hash'>; token: string };
+    await sb.auth.setSession({ access_token: payload.token, refresh_token: '' });
+    // Stash password_hash locally so deleteSpace can still verify without a re-fetch.
+    return { ...payload.space, password_hash } as Space;
   }
   return localDb.createSpace({ name, invite_code, password_hash });
 }
@@ -57,27 +60,16 @@ async function createSpace(name: string, password: string): Promise<Space> {
 async function deleteSpace(spaceId: string, password: string): Promise<void> {
   const sb = getSupabase();
   if (sb) {
-    // 1. Récupérer le space pour vérifier le hash
-    const { data: space, error: e1 } = await sb
-      .from('spaces')
-      .select('id, password_hash')
-      .eq('id', spaceId)
-      .maybeSingle();
-    if (e1) throw e1;
-    if (!space) throw new Error(ERR_SPACE_NOT_FOUND);
-    if (!verifyPassword(password, (space as Space).password_hash)) {
-      throw new Error(ERR_WRONG_PASSWORD);
+    const { error } = await sb.rpc('delete_space_secure', {
+      p_space_id: spaceId,
+      p_password_hash: hashPassword(password),
+    });
+    if (error) {
+      if (error.code === '28P01' || error.message?.includes('WRONG_PASSWORD')) {
+        throw new Error(ERR_WRONG_PASSWORD);
+      }
+      throw error;
     }
-
-    // 2. Cascade explicite (au cas où les FK n'auraient pas ON DELETE CASCADE)
-    const { error: er } = await sb.from('relations').delete().eq('space_id', spaceId);
-    if (er) throw er;
-    const { error: ec } = await sb.from('characters').delete().eq('space_id', spaceId);
-    if (ec) throw ec;
-    const { error: el } = await sb.from('locations').delete().eq('space_id', spaceId);
-    if (el) throw el;
-    const { error: es } = await sb.from('spaces').delete().eq('id', spaceId);
-    if (es) throw es;
     return;
   }
 
@@ -98,17 +90,22 @@ async function joinSpace(inviteCode: string, password: string): Promise<Space> {
 
   const sb = getSupabase();
   if (sb) {
-    const { data, error } = await sb
-      .from('spaces')
-      .select('*')
-      .eq('invite_code', inviteCode)
-      .maybeSingle();
-    if (error) throw error;
-    if (!data) throw new Error(ERR_SPACE_NOT_FOUND);
-    if (!verifyPassword(password, (data as Space).password_hash)) {
-      throw new Error(ERR_WRONG_PASSWORD);
+    const password_hash = hashPassword(password);
+    const { data, error } = await sb.rpc('issue_space_token', {
+      p_invite_code: inviteCode,
+      p_password_hash: password_hash,
+    });
+    if (error) {
+      // The RPC returns the same error for missing-space and wrong-password
+      // (to avoid leaking which invite codes exist). Surface as wrong-password.
+      if (error.code === '28P01' || error.message?.includes('WRONG_PASSWORD')) {
+        throw new Error(ERR_WRONG_PASSWORD);
+      }
+      throw error;
     }
-    return data as Space;
+    const payload = data as { space: Omit<Space, 'password_hash'>; token: string };
+    await sb.auth.setSession({ access_token: payload.token, refresh_token: '' });
+    return { ...payload.space, password_hash } as Space;
   }
   const space = localDb.findSpaceByCode(inviteCode);
   if (!space) throw new Error(ERR_SPACE_NOT_FOUND);
